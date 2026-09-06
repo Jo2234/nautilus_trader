@@ -5155,12 +5155,14 @@ fn test_delete_range_preserves_source_when_decoding_fails() {
     use nautilus_serialization::arrow::EncodeToRecordBatch;
     use parquet::arrow::ArrowWriter;
 
-    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let (temp_dir, mut catalog) = create_temp_catalog();
     let quotes = [
         create_quote_tick(1_000_000_000),
         create_quote_tick(3_000_000_000),
     ];
-    let path = catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    let object_path = catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    let path = temp_dir.path().join(&object_path);
+    assert!(path.is_file());
     // Keep a valid Parquet schema and timestamps, but remove the metadata needed
     // by the QuoteTick decoder. Discovery/planning succeed; record decoding fails.
     let malformed = QuoteTick::encode_batch(&HashMap::new(), &quotes).unwrap();
@@ -5182,7 +5184,7 @@ fn test_delete_range_preserves_source_when_decoding_fails() {
     assert_eq!(fs::read(&path).unwrap(), original);
     assert_eq!(
         catalog
-            .list_parquet_files(path.parent().unwrap().to_str().unwrap())
+            .list_parquet_files(object_path.parent().unwrap().to_str().unwrap())
             .unwrap()
             .len(),
         1
