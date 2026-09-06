@@ -22,6 +22,7 @@ from asyncio import Future
 from asyncio import Queue
 from collections.abc import Callable
 from concurrent.futures import Executor
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -147,6 +148,8 @@ class ActorExecutor:
             pass  # Ignore the exception since we intentionally cancelled the task
         except TimeoutError:
             self._log.warning("Executor: TimeoutError shutting down worker")
+        except Exception as e:
+            self._log.exception("Executor: Worker failed before shutdown", e)
 
         # Use a dedicated thread to avoid self-join issue when the executor
         # is also the loop's default executor
@@ -190,7 +193,10 @@ class ActorExecutor:
                     self._add_active_task(task_id, task)
                     self._log.debug(f"Executor: Scheduled {task_id}, {task}")
 
-                    await asyncio.wrap_future(self._active_tasks[task_id])
+                    # The done callback logs the original exception with its traceback.
+                    # A failed work item must not stop the sequential queue worker.
+                    with suppress(Exception):
+                        await task
                 except asyncio.CancelledError:
                     current_task = asyncio.current_task()
                     if current_task and current_task.cancelling() > 0:

@@ -29,6 +29,15 @@ DEFAULT_FUTURE_CANCELLATION_TIMEOUT: float = 2.0
 DEFAULT_TASK_CANCELLATION_TIMEOUT: float = 5.0
 
 
+_pending_cancellations: set[asyncio.Future] = set()
+
+
+def _release_cancelled_task(task: asyncio.Future) -> None:
+    _pending_cancellations.discard(task)
+    if not task.cancelled():
+        task.exception()  # Retrieve late failures, including those after the deadline.
+
+
 async def cancel_tasks_with_timeout(
     tasks: WeakSet[asyncio.Task] | set[asyncio.Task | asyncio.Future],
     logger: Logger | None = None,
@@ -54,7 +63,7 @@ async def cancel_tasks_with_timeout(
     Notes
     -----
     - Takes a strong reference snapshot to prevent tasks from being GC'd during cancellation.
-    - Uses return_exceptions=True to prevent "exception was never retrieved" warnings.
+    - Retains canceled tasks until completion and retrieves any late exceptions.
     - Logs timeout warnings if tasks don't complete within the specified timeout.
 
     """
@@ -69,25 +78,24 @@ async def cancel_tasks_with_timeout(
     if logger:
         logger.debug(f"Canceling {len(pending_tasks)} pending tasks")
 
-    # Cancel all tasks
+    # Retain tasks even if they outlive the deadline or this caller is canceled.
     for task in pending_tasks:
+        if task not in _pending_cancellations:
+            _pending_cancellations.add(task)
+            task.add_done_callback(_release_cancelled_task)
         task.cancel()
 
-    # Await with the strong references we captured
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*pending_tasks, return_exceptions=True),
-            timeout=timeout_secs,
-        )
-
-        if logger:
-            logger.debug(f"Successfully canceled {len(pending_tasks)} tasks")
-    except TimeoutError:
+    # Unlike wait_for(gather(...)), wait does not wait for cancellation to finish
+    # after the timeout, so a task suppressing CancelledError cannot defeat it.
+    _, still_pending = await asyncio.wait(pending_tasks, timeout=timeout_secs)
+    if still_pending:
         if logger:
             logger.warning(
                 f"Timeout ({timeout_secs}s) waiting for {len(pending_tasks)} tasks to cancel",
             )
             _log_still_pending_tasks(pending_tasks, logger)
+    elif logger:
+        logger.debug(f"Successfully canceled {len(pending_tasks)} tasks")
 
 
 def _log_still_pending_tasks(

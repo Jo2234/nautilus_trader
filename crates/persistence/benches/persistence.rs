@@ -34,10 +34,10 @@ fn single_stream_bench(c: &mut Criterion) {
                 catalog
                     .add_file::<QuoteTick>("quote_tick", file_path, None, None)
                     .unwrap();
-                catalog.get_query_result()
+                catalog.get_query_result().unwrap()
             },
             |query_result: &mut QueryResult| {
-                let count: usize = query_result.count();
+                let count: usize = query_result.map(Result::unwrap).count();
                 assert_eq!(count, 9_689_614);
             },
             BatchSize::SmallInput,
@@ -86,10 +86,10 @@ fn multi_stream_bench(c: &mut Criterion) {
                     }
                 }
 
-                catalog.get_query_result()
+                catalog.get_query_result().unwrap()
             },
             |query_result: &mut QueryResult| {
-                let count: usize = query_result.count();
+                let count: usize = query_result.map(Result::unwrap).count();
                 assert_eq!(count, 72_536_038);
             },
             BatchSize::SmallInput,

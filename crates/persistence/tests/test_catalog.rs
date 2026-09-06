@@ -304,8 +304,8 @@ fn test_quote_tick_query() {
     catalog
         .add_file::<QuoteTick>("quote_005", file_path.as_str(), None, None)
         .unwrap();
-    let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = catalog.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     if let Data::Quote(q) = ticks[0] {
         assert_eq!("EUR/USD.SIM", q.instrument_id.to_string());
@@ -330,8 +330,8 @@ fn test_quote_tick_query_with_filter() {
             None,
         )
         .unwrap();
-    let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = catalog.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
     assert!(is_monotonically_increasing_by_init(&ticks));
 }
 
@@ -348,8 +348,8 @@ fn test_quote_tick_multiple_query() {
     catalog
         .add_file::<TradeTick>("quote_tick_2", file_path_trades.as_str(), None, None)
         .unwrap();
-    let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = catalog.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     assert_eq!(ticks.len(), expected_length);
     assert!(is_monotonically_increasing_by_init(&ticks));
@@ -364,8 +364,8 @@ fn test_trade_tick_query() {
     catalog
         .add_file::<TradeTick>("trade_001", file_path.as_str(), None, None)
         .unwrap();
-    let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = catalog.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     if let Data::Trade(t) = ticks[0] {
         assert_eq!("EUR/USD.SIM", t.instrument_id.to_string());
@@ -386,8 +386,8 @@ fn test_bar_query() {
     catalog
         .add_file::<Bar>("bar_001", file_path.as_str(), None, None)
         .unwrap();
-    let query_result: QueryResult = catalog.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = catalog.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     if let Data::Bar(b) = &ticks[0] {
         assert_eq!("ADABTC.BINANCE", b.bar_type.instrument_id().to_string());
@@ -414,8 +414,8 @@ fn test_datafusion_parquet_round_trip() {
     session
         .add_file::<QuoteTick>("test_data", file_path.as_str(), None, None)
         .unwrap();
-    let query_result: QueryResult = session.get_query_result();
-    let quote_ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = session.get_query_result().unwrap();
+    let quote_ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
     let quote_ticks: Vec<QuoteTick> = to_variant(quote_ticks);
 
     let metadata = HashMap::from([
@@ -449,8 +449,8 @@ fn test_datafusion_parquet_round_trip() {
     session
         .add_file::<QuoteTick>("test_data", temp_file_path.to_str().unwrap(), None, None)
         .unwrap();
-    let query_result: QueryResult = session.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = session.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
     let ticks_variants: Vec<QuoteTick> = to_variant(ticks);
 
     assert_eq!(quote_ticks.len(), ticks_variants.len());
@@ -737,8 +737,8 @@ fn test_register_object_store_from_uri_local_file() {
     session
         .add_file::<TradeTick>("trade_ticks", &file_path, None, None)
         .unwrap();
-    let query_result: QueryResult = session.get_query_result();
-    let ticks: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = session.get_query_result().unwrap();
+    let ticks: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     assert_eq!(ticks.len(), 100);
     assert!(is_monotonically_increasing_by_init(&ticks));
@@ -3312,7 +3312,7 @@ fn test_catalog_query_multiple_instruments_table_naming() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     // Should get all 9 quotes (3 from each instrument)
     assert_eq!(data.len(), 9);
@@ -3371,7 +3371,7 @@ fn test_query_directory_based_registration() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     // Should get all 9 quotes from all 3 files in the directory
     assert_eq!(data.len(), 9, "Should read all files in directory");
@@ -3406,7 +3406,7 @@ fn test_query_directory_based_registration_preserves_equal_timestamp_order() {
         .query::<QuoteTick>(None, None, None, None, None, true)
         .unwrap();
     let instrument_ids: Vec<String> = result
-        .map(|data| match data {
+        .map(|data| match data.unwrap() {
             Data::Quote(quote) => quote.instrument_id.to_string(),
             _ => panic!("Invalid test"),
         })
@@ -3455,7 +3455,7 @@ fn test_query_file_based_registration() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     // Should only get 3 quotes from the first file
     assert_eq!(data.len(), 3, "Should only read the specified file");
@@ -3490,7 +3490,10 @@ fn test_query_directory_based_vs_file_based() {
         None,
         true, // directory-based
     );
-    let data_dir: Vec<Data> = result_dir.unwrap().collect();
+    let data_dir: Vec<Data> = result_dir
+        .unwrap()
+        .collect::<anyhow::Result<Vec<_>>>()
+        .unwrap();
 
     // Query with file-based registration (all files)
     let result_file = catalog.query::<QuoteTick>(
@@ -3501,7 +3504,10 @@ fn test_query_directory_based_vs_file_based() {
         Some(all_files),
         false, // file-based
     );
-    let data_file: Vec<Data> = result_file.unwrap().collect();
+    let data_file: Vec<Data> = result_file
+        .unwrap()
+        .collect::<anyhow::Result<Vec<_>>>()
+        .unwrap();
 
     // Both should return the same data
     assert_eq!(data_dir.len(), data_file.len());
@@ -4211,7 +4217,7 @@ fn test_query_directory_based_registration_with_cloud_uri() {
     );
 
     let query_result = result.unwrap();
-    let data: Vec<Data> = query_result.collect();
+    let data: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     // Should get all 4 quotes from both files in the directory
     assert_eq!(data.len(), 4, "Should read all files in directory");
@@ -4234,8 +4240,8 @@ fn test_duplicate_table_registration() {
         .add_file::<QuoteTick>("test_table", file_path.as_str(), None, None)
         .unwrap();
 
-    let query_result: QueryResult = session.get_query_result();
-    let data: Vec<Data> = query_result.collect();
+    let query_result: QueryResult = session.get_query_result().unwrap();
+    let data: Vec<Data> = query_result.collect::<anyhow::Result<Vec<_>>>().unwrap();
 
     // Should only get data once, not duplicated
     // The quotes.parquet file contains 9500 quotes
@@ -5142,4 +5148,43 @@ fn test_instrument_roundtrip_with_unregistered_base_currency() {
     };
     assert_eq!(decoded.base_currency.code.as_str(), unknown_code);
     assert_eq!(decoded.base_currency.currency_type, CurrencyType::Crypto);
+}
+
+#[rstest]
+fn test_delete_range_preserves_source_when_decoding_fails() {
+    use nautilus_serialization::arrow::EncodeToRecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let quotes = [
+        create_quote_tick(1_000_000_000),
+        create_quote_tick(3_000_000_000),
+    ];
+    let path = catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+    // Keep a valid Parquet schema and timestamps, but remove the metadata needed
+    // by the QuoteTick decoder. Discovery/planning succeed; record decoding fails.
+    let malformed = QuoteTick::encode_batch(&HashMap::new(), &quotes).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(&path).unwrap(), malformed.schema(), None).unwrap();
+    writer.write(&malformed).unwrap();
+    writer.close().unwrap();
+    let original = fs::read(&path).unwrap();
+
+    let error = catalog
+        .delete_data_range(
+            "quotes",
+            Some("ETH/USDT.BINANCE"),
+            Some(UnixNanos::from(2_000_000_000)),
+            Some(UnixNanos::from(2_500_000_000)),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("instrument_id"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        catalog
+            .list_parquet_files(path.parent().unwrap().to_str().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
 }

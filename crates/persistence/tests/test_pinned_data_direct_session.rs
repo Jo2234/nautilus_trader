@@ -35,7 +35,11 @@ fn test_pinned_quotes_through_direct_session() {
             None,
         )
         .unwrap();
-    let data: Vec<Data> = session.get_query_result().collect();
+    let data: Vec<Data> = session
+        .get_query_result()
+        .unwrap()
+        .collect::<anyhow::Result<_>>()
+        .unwrap();
 
     assert_eq!(data.len(), 20_000);
     assert!(data.iter().all(|item| matches!(item, Data::Quote(_))));

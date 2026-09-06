@@ -192,7 +192,7 @@ impl DataBackendSession {
             .map_err(to_pyruntime_err)
     }
 
-    fn to_query_result(mut slf: PyRefMut<'_, Self>) -> DataQueryResult {
+    fn to_query_result(mut slf: PyRefMut<'_, Self>) -> PyResult<DataQueryResult> {
         let py = slf.py();
         let chunk_size = slf.chunk_size;
         let ptr = SendPtr(&raw mut *slf);
@@ -208,7 +208,10 @@ impl DataBackendSession {
             })
         };
 
-        DataQueryResult::new(query_result, chunk_size)
+        Ok(DataQueryResult::new(
+            query_result.map_err(to_pyruntime_err)?,
+            chunk_size,
+        ))
     }
 
     /// Register an object store with the session context from a URI with optional storage options.
@@ -253,15 +256,13 @@ impl DataQueryResult {
                 let mut data = Vec::new();
 
                 for chunk in result.by_ref() {
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    data.extend(chunk);
+                    data.extend(chunk?);
                 }
 
-                data
+                Ok::<_, anyhow::Error>(data)
             })
-        };
+        }
+        .map_err(to_pyruntime_err)?;
 
         data.into_iter()
             .map(|item| data_to_pyobject(py, item))
@@ -298,7 +299,7 @@ impl DataQueryResult {
             })
         };
 
-        match acc {
+        match acc.transpose().map_err(to_pyruntime_err)? {
             Some(acc) if !acc.is_empty() => {
                 let has_non_ffi = acc.iter().any(|d| {
                     matches!(
@@ -338,5 +339,45 @@ impl DataQueryResult {
             }
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nautilus_model::data::stubs::quote_audusd;
+    use pyo3::exceptions::PyRuntimeError;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::backend::{
+        kmerge_batch::{EagerStream, KMerge},
+        session::TsInitComparator,
+    };
+
+    #[rstest]
+    #[case("to_list")]
+    #[case("__next__")]
+    fn python_query_consumers_raise_stream_errors(#[case] method: &str) {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let quote = Data::Quote(quote_audusd());
+        let input = futures::stream::iter(vec![
+            Ok(vec![quote.clone(), quote].into_iter()),
+            Err(anyhow::anyhow!("injected Python query failure")),
+        ]);
+        let mut merge = KMerge::new(TsInitComparator);
+        merge
+            .push_iter(EagerStream::from_stream_with_runtime(input, runtime))
+            .unwrap();
+        let result = DataQueryResult::new(merge, 10);
+
+        Python::initialize();
+        Python::attach(|py| {
+            let result = Py::new(py, result).unwrap();
+            let error = result.bind(py).call_method0(method).unwrap_err();
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            assert!(error.to_string().contains("injected Python query failure"));
+        });
     }
 }

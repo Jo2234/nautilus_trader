@@ -15,7 +15,6 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from unittest.mock import Mock
 
 import pytest
@@ -452,9 +451,13 @@ async def test_queued_exception_logged_with_traceback(logger: Mock) -> None:
     # Assert
     await eventually(lambda: logger.exception.called)
 
-    # Expected - worker was processing when shutdown was called
-    with suppress(ValueError):
-        await actor_executor.shutdown()
+    # A failed item must not strand the next item or prevent executor shutdown.
+    results = []
+    actor_executor.queue_for_executor(results.append, "next item")
+    await eventually(lambda: results == ["next item"])
+    await actor_executor.shutdown()
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        thread_pool.submit(lambda: None)
 
     assert logger.exception.call_count == 1
     call_args = logger.exception.call_args[0]
@@ -464,3 +467,18 @@ async def test_queued_exception_logged_with_traceback(logger: Mock) -> None:
     assert "Executor: Exception in" in error_message
     assert isinstance(exception_arg, ValueError)
     assert "Invalid signal data" in str(exception_arg)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_executor_after_worker_submission_failure(logger: Mock) -> None:
+    loop = asyncio.get_running_loop()
+    thread_pool = Mock(spec=ThreadPoolExecutor)
+    thread_pool.submit.side_effect = RuntimeError("executor submission failed")
+    actor_executor = ActorExecutor(loop=loop, executor=thread_pool, logger=logger)
+    actor_executor.queue_for_executor(lambda: None)
+    await eventually(lambda: actor_executor._worker_task.done())
+
+    await actor_executor.shutdown()
+
+    thread_pool.shutdown.assert_called_once_with(wait=True)
+    assert any(isinstance(call.args[1], RuntimeError) for call in logger.exception.call_args_list)

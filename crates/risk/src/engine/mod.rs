@@ -993,7 +993,6 @@ impl RiskEngine {
         orders: &[&OrderAny],
         account_id: Option<AccountId>,
     ) -> bool {
-        let mut last_px: Option<Price> = None;
         let mut max_notional: Option<Money> = None;
 
         // Determine max notional
@@ -1036,6 +1035,7 @@ impl RiskEngine {
             return true;
         };
 
+        let resolved_account_id = account.id();
         let is_margin = matches!(account, AccountAny::Margin(_));
         let is_betting = matches!(account, AccountAny::Betting(_));
         let free = match &account {
@@ -1061,7 +1061,7 @@ impl RiskEngine {
                     None,
                     Some(&instrument.id()),
                     None,
-                    None,
+                    Some(&resolved_account_id),
                     Some(PositionSide::Long),
                 )
                 .iter()
@@ -1072,7 +1072,7 @@ impl RiskEngine {
                     None,
                     Some(&instrument.id()),
                     None,
-                    None,
+                    Some(&resolved_account_id),
                     Some(OrderSide::Sell),
                 )
                 .iter()
@@ -1098,7 +1098,7 @@ impl RiskEngine {
                     None,
                     Some(&instrument.id()),
                     None,
-                    None,
+                    Some(&resolved_account_id),
                     Some(PositionSide::Short),
                 )
                 .iter()
@@ -1109,7 +1109,7 @@ impl RiskEngine {
                     None,
                     Some(&instrument.id()),
                     None,
-                    None,
+                    Some(&resolved_account_id),
                     Some(OrderSide::Buy),
                 )
                 .iter()
@@ -1139,49 +1139,45 @@ impl RiskEngine {
 
         for order in orders {
             // Determine last price based on order type
-            last_px = match order {
+            let last_px = match order {
                 OrderAny::Market(_) | OrderAny::MarketToLimit(_) => {
-                    if last_px.is_none() {
-                        let quote_price = {
-                            let cache = self.cache.borrow();
-                            cache.quote(&instrument.id()).map(|last_quote| {
-                                match order.order_side() {
-                                    OrderSide::Buy => Ok(last_quote.ask_price),
-                                    OrderSide::Sell => Ok(last_quote.bid_price),
-                                    OrderSide::NoOrderSide => {
-                                        Err(OrderDeniedReason::InvalidOrderSide {
-                                            order_side: order.order_side(),
-                                        }
-                                        .to_string())
+                    let quote_price = {
+                        let cache = self.cache.borrow();
+                        cache
+                            .quote(&instrument.id())
+                            .map(|last_quote| match order.order_side() {
+                                OrderSide::Buy => Ok(last_quote.ask_price),
+                                OrderSide::Sell => Ok(last_quote.bid_price),
+                                OrderSide::NoOrderSide => {
+                                    Err(OrderDeniedReason::InvalidOrderSide {
+                                        order_side: order.order_side(),
                                     }
+                                    .to_string())
                                 }
                             })
-                        };
+                    };
 
-                        if let Some(quote_price) = quote_price {
-                            match quote_price {
-                                Ok(price) => Some(price),
-                                Err(reason) => {
-                                    self.deny_order(order, &reason);
-                                    return false; // Denied
-                                }
-                            }
-                        } else {
-                            let cache = self.cache.borrow();
-                            let last_trade = cache.trade(&instrument.id());
-
-                            if let Some(last_trade) = last_trade {
-                                Some(last_trade.price)
-                            } else {
-                                log::warn!(
-                                    "Cannot check MARKET order risk: no prices for {}",
-                                    instrument.id()
-                                );
-                                continue;
+                    if let Some(quote_price) = quote_price {
+                        match quote_price {
+                            Ok(price) => Some(price),
+                            Err(reason) => {
+                                self.deny_order(order, &reason);
+                                return false; // Denied
                             }
                         }
                     } else {
-                        last_px
+                        let cache = self.cache.borrow();
+                        let last_trade = cache.trade(&instrument.id());
+
+                        if let Some(last_trade) = last_trade {
+                            Some(last_trade.price)
+                        } else {
+                            log::warn!(
+                                "Cannot check MARKET order risk: no prices for {}",
+                                instrument.id()
+                            );
+                            continue;
+                        }
                     }
                 }
                 OrderAny::StopMarket(_) | OrderAny::MarketIfTouched(_) => order.trigger_price(),

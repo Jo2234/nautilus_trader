@@ -15,6 +15,8 @@
 
 import asyncio
 import contextlib
+import gc
+from unittest.mock import Mock
 from weakref import WeakSet
 
 import pytest
@@ -76,26 +78,51 @@ async def test_cancel_pending_tasks_successfully():
 
 
 @pytest.mark.asyncio
-async def test_cancel_with_timeout_exceeded():
+@pytest.mark.parametrize("raise_after_release", [False, True])
+async def test_cancel_with_timeout_exceeded(raise_after_release):
     # Arrange
     tasks: WeakSet[asyncio.Task] = WeakSet()
-    logger = Logger("TestLogger")
+    logger = Mock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    errors = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, context: errors.append(context))
 
     async def stubborn_task():
-        while True:
+        started.set()
+        while not release.is_set():
             with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.sleep(0.1)
+                await release.wait()
+        finished.set()
+        if raise_after_release:
+            raise ValueError("late cancellation failure")
 
     task = asyncio.create_task(stubborn_task())
     tasks.add(task)
 
-    # Act
-    await cancel_tasks_with_timeout(tasks, logger, timeout_secs=0.5)
+    # Start the coroutine before cancellation so it can actually suppress the signal.
+    await started.wait()
+    cleanup = asyncio.create_task(cancel_tasks_with_timeout(tasks, logger, timeout_secs=0.01))
+    try:
+        done, _ = await asyncio.wait({cleanup}, timeout=1.0)
+        assert cleanup in done
+        await cleanup
+        assert not task.done()
+        assert any("Timeout" in call.args[0] for call in logger.warning.call_args_list)
+    finally:
+        release.set()
+        await finished.wait()
+        await cleanup
+        # Let the completion callback retrieve any exception after the deadline.
+        await asyncio.sleep(0)
+        del task
+        gc.collect()
+        loop.set_exception_handler(previous_handler)
 
-    # Assert - should timeout waiting for cancellation
-    task.cancel()
-    with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=0.1)
+    assert errors == []
 
 
 @pytest.mark.asyncio

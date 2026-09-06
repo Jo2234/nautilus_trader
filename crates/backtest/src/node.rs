@@ -408,7 +408,12 @@ fn run_streaming(
     } else {
         // Multiple configs require loading all data to merge-sort across types
         let all_data = load_and_merge_data(config)?;
-        stream_chunks(engine, config, all_data.into_iter().peekable(), chunk_size)?;
+        stream_chunks(
+            engine,
+            config,
+            all_data.into_iter().map(Ok).peekable(),
+            chunk_size,
+        )?;
     }
 
     Ok(())
@@ -417,7 +422,7 @@ fn run_streaming(
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
 // Each chunk contains up to `chunk_size` events, extended to include all
 // events sharing the boundary timestamp so timers flush correctly.
-fn stream_chunks<I: Iterator<Item = Data>>(
+fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     engine: &mut BacktestEngine,
     config: &BacktestRunConfig,
     mut iter: Peekable<I>,
@@ -431,7 +436,7 @@ fn stream_chunks<I: Iterator<Item = Data>>(
     let mut next_start = config.start();
 
     loop {
-        let chunk = take_aligned_chunk(&mut iter, chunk_size);
+        let chunk = take_aligned_chunk(&mut iter, chunk_size)?;
         if chunk.is_empty() {
             break;
         }
@@ -464,26 +469,35 @@ fn stream_chunks<I: Iterator<Item = Data>>(
 
 // Takes up to `chunk_size` items, then extends to include all remaining
 // items sharing the boundary timestamp to avoid splitting same-ts events.
-fn take_aligned_chunk<I: Iterator<Item = Data>>(
+fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
     iter: &mut Peekable<I>,
     chunk_size: usize,
-) -> Vec<Data> {
+) -> anyhow::Result<Vec<Data>> {
     let mut chunk = Vec::with_capacity(chunk_size);
 
     for _ in 0..chunk_size {
         match iter.next() {
-            Some(item) => chunk.push(item),
-            None => return chunk,
+            Some(item) => chunk.push(item?),
+            None => return Ok(chunk),
         }
     }
 
     if let Some(boundary_ts) = chunk.last().map(HasTsInit::ts_init) {
-        while iter.peek().is_some_and(|d| d.ts_init() == boundary_ts) {
-            chunk.push(iter.next().unwrap());
+        loop {
+            match iter.peek() {
+                Some(Ok(data)) if data.ts_init() == boundary_ts => {
+                    chunk.push(iter.next().unwrap()?);
+                }
+                Some(Err(_)) => {
+                    // Surface a failed lookahead before running a seemingly complete chunk.
+                    return Err(iter.next().unwrap().unwrap_err());
+                }
+                _ => break,
+            }
         }
     }
 
-    chunk
+    Ok(chunk)
 }
 
 fn load_and_merge_data(config: &BacktestRunConfig) -> anyhow::Result<Vec<Data>> {
@@ -520,7 +534,7 @@ fn load_data(
 ) -> anyhow::Result<Vec<Data>> {
     let mut catalog = create_catalog(config)?;
     let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
-    Ok(result.collect())
+    result.collect()
 }
 
 fn dispatch_query(
@@ -589,5 +603,40 @@ fn min_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use nautilus_model::data::stubs::quote_audusd;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn quote_at(ts: u64) -> Data {
+        let mut quote = quote_audusd();
+        quote.ts_init = UnixNanos::from(ts);
+        Data::Quote(quote)
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(10)]
+    fn aligned_chunk_propagates_read_failure(#[case] chunk_size: usize) {
+        let mut stream = vec![Ok(quote_at(1)), Err(anyhow::anyhow!("failed read"))]
+            .into_iter()
+            .peekable();
+        let error = take_aligned_chunk(&mut stream, chunk_size).unwrap_err();
+        assert_eq!(error.to_string(), "failed read");
+    }
+
+    #[rstest]
+    fn fallible_chunks_preserve_timestamp_alignment() {
+        let mut stream = vec![Ok(quote_at(1)), Ok(quote_at(1)), Ok(quote_at(2))]
+            .into_iter()
+            .peekable();
+        assert_eq!(take_aligned_chunk(&mut stream, 1).unwrap().len(), 2);
+        assert_eq!(take_aligned_chunk(&mut stream, 1).unwrap().len(), 1);
+        assert!(take_aligned_chunk(&mut stream, 1).unwrap().is_empty());
     }
 }
