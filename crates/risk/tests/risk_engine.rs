@@ -7285,3 +7285,220 @@ fn test_submit_sell_cash_account_with_long_position_reduces_then_passes(
         get_execute_order_event_handler_messages(&execute_order_event_handler);
     assert_eq!(saved_execute_messages.len(), 1);
 }
+
+#[rstest]
+#[case(OrderSide::Sell, true, None, false)]
+#[case(OrderSide::Buy, true, None, false)]
+#[case(OrderSide::Sell, false, None, true)]
+#[case(OrderSide::Buy, false, None, true)]
+#[case(OrderSide::Sell, false, Some(false), true)]
+#[case(OrderSide::Buy, false, Some(false), true)]
+#[case(OrderSide::Sell, false, Some(true), false)]
+#[case(OrderSide::Buy, false, Some(true), false)]
+fn test_reduction_uses_resolved_account_positions_and_pending_orders(
+    #[case] side: OrderSide,
+    #[case] position_in_other_account: bool,
+    #[case] pending_in_target_account: Option<bool>,
+    #[case] allowed: bool,
+    #[values(false, true)] explicit_account: bool,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+) {
+    let target_id = AccountId::from("BINANCE-001");
+    let other_id = AccountId::from("BINANCE-002");
+    let mut target = margin_account_with_usdt_balance("100 USDT", "0 USDT", "100 USDT");
+    target.set_default_leverage(dec!(10));
+    let mut other_state = target.base.events[0].clone();
+    other_state.account_id = other_id;
+    let mut cache = Cache::default();
+    cache.add_instrument(instrument_eth_usdt.clone()).unwrap();
+    cache
+        .add_account(AccountAny::Margin(MarginAccount::new(other_state, true)))
+        .unwrap();
+    // The last account added is the venue fallback for an unassigned order.
+    cache.add_account(AccountAny::Margin(target)).unwrap();
+    cache
+        .add_quote(QuoteTick::new(
+            instrument_eth_usdt.id(),
+            Price::from("3000.00"),
+            Price::from("3000.01"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+    let entry_side = if side == OrderSide::Sell {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(entry_side)
+        .quantity(Quantity::from("10.000"))
+        .build();
+    let owner = if position_in_other_account {
+        other_id
+    } else {
+        target_id
+    };
+    let mut fill = order_filled(
+        &entry,
+        &instrument_eth_usdt,
+        None,
+        Some(owner),
+        Some(VenueOrderId::from("V-ENTRY")),
+        None,
+        None,
+        Some(Price::from("3000.00")),
+        None,
+        None,
+        None,
+    );
+    fill.position_id = Some(PositionId::from("P-ENTRY"));
+    cache
+        .add_position(&Position::new(&instrument_eth_usdt, fill), OmsType::Hedging)
+        .unwrap();
+
+    if let Some(in_target) = pending_in_target_account {
+        let pending = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .client_order_id(ClientOrderId::from("O-PENDING"))
+            .side(side)
+            .quantity(Quantity::from("10.000"))
+            .build();
+        let account_id = if in_target { target_id } else { other_id };
+        cache.add_order(pending.clone(), None, None, false).unwrap();
+        let mut submitted = order_submitted(&pending);
+        submitted.account_id = account_id;
+        cache
+            .update_order(&OrderEventAny::Submitted(submitted))
+            .unwrap();
+        cache
+            .update_order(&OrderEventAny::Accepted(order_accepted(
+                &pending,
+                Some(VenueOrderId::from("V-PENDING")),
+                Some(account_id),
+            )))
+            .unwrap();
+    }
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .client_order_id(ClientOrderId::from("O-CLOSE"))
+        .side(side)
+        .quantity(Quantity::from("5.000"))
+        .build();
+
+    if explicit_account {
+        let OrderAny::Market(market) = &mut order else {
+            unreachable!()
+        };
+        market.account_id = Some(target_id);
+    }
+    assert_eq!(order.account_id(), explicit_account.then_some(target_id));
+    cache.add_order(order.clone(), None, None, false).unwrap();
+    let mut engine = get_risk_engine(Some(Rc::new(RefCell::new(cache))), None, None, false);
+    engine.execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    )));
+    let denied = get_process_order_event_handler_messages(&process_order_event_handler);
+    let executed = get_execute_order_event_handler_messages(&execute_order_event_handler);
+    assert_eq!(executed.len(), usize::from(allowed));
+    assert_eq!(denied.len(), usize::from(!allowed));
+    if !allowed {
+        assert_eq!(denied[0].event_type(), OrderEventType::Denied);
+    }
+}
+
+#[rstest]
+#[case(OrderType::Limit, OrderSide::Buy, OrderType::Market)]
+#[case(OrderType::StopMarket, OrderSide::Buy, OrderType::Market)]
+#[case(OrderType::Market, OrderSide::Sell, OrderType::Market)]
+#[case(OrderType::Limit, OrderSide::Buy, OrderType::MarketToLimit)]
+fn test_order_list_market_price_is_independent_of_previous_order(
+    #[case] first_type: OrderType,
+    #[case] first_side: OrderSide,
+    #[case] second_type: OrderType,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+) {
+    let mut cache = Cache::default();
+    cache.add_instrument(instrument_eth_usdt.clone()).unwrap();
+    cache
+        .add_account(AccountAny::Margin(margin_account_with_usdt_balance(
+            "100000 USDT",
+            "0 USDT",
+            "100000 USDT",
+        )))
+        .unwrap();
+    cache
+        .add_quote(QuoteTick::new(
+            instrument_eth_usdt.id(),
+            Price::from("1000.00"),
+            Price::from("3000.00"),
+            Quantity::from("100"),
+            Quantity::from("100"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+        .unwrap();
+    let mut first_builder = OrderTestBuilder::new(first_type);
+    first_builder
+        .instrument_id(instrument_eth_usdt.id())
+        .client_order_id(ClientOrderId::from("O-FIRST"))
+        .side(first_side)
+        .quantity(Quantity::from("1.000"));
+    if first_type == OrderType::Limit {
+        first_builder.price(Price::from("1000.00"));
+    }
+
+    if first_type == OrderType::StopMarket {
+        first_builder.trigger_price(Price::from("1000.00"));
+    }
+    let first = first_builder.build();
+    let second = OrderTestBuilder::new(second_type)
+        .instrument_id(instrument_eth_usdt.id())
+        .client_order_id(ClientOrderId::from("O-SECOND"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .build();
+    let orders = [first, second];
+    for order in &orders {
+        cache.add_order(order.clone(), None, None, true).unwrap();
+    }
+    let mut engine = get_risk_engine(Some(Rc::new(RefCell::new(cache))), None, None, false);
+    engine.set_max_notional_per_order(instrument_eth_usdt.id(), dec!(2000));
+    let list = OrderList::new(
+        OrderListId::from("OL-PRICES"),
+        instrument_eth_usdt.id(),
+        orders[0].strategy_id(),
+        orders.iter().map(Order::client_order_id).collect(),
+        UnixNanos::default(),
+    );
+    engine.execute(TradingCommand::SubmitOrderList(SubmitOrderList::new(
+        orders[0].trader_id(),
+        None,
+        orders[0].strategy_id(),
+        list,
+        orders.iter().map(|o| o.init_event().clone()).collect(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    )));
+    assert!(get_execute_order_event_handler_messages(&execute_order_event_handler).is_empty());
+    let denied = get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(denied[0].client_order_id(), ClientOrderId::from("O-SECOND"));
+    assert_eq!(denied[0].event_type(), OrderEventType::Denied);
+}

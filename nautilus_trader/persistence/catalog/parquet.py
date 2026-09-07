@@ -1011,6 +1011,7 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         # Phase 2: Execute queries, write, and delete
         file_start_ns = None  # Track contiguity across periods
+        rewritten_intervals = P.empty()
 
         for query_info in queries_to_execute:
             query_is_protected = any(
@@ -1059,6 +1060,11 @@ class ParquetDataCatalog(BaseDataCatalog):
             )
 
             if not period_data:
+                # An empty successful read also proves that this range is preserved.
+                rewritten_intervals |= P.closedopen(
+                    query_info["query_start"],
+                    query_info["query_end"] + 1,
+                )
                 # Skip if no data found, but maintain contiguity by using query start
                 if file_start_ns is None:
                     file_start_ns = query_info["query_start"]
@@ -1100,21 +1106,23 @@ class ParquetDataCatalog(BaseDataCatalog):
                 end=file_end_ns,
                 skip_disjoint_check=True,
             )
+            rewritten_intervals |= P.closedopen(
+                query_info["query_start"],
+                query_info["query_end"] + 1,
+            )
 
             # Clear the data from memory immediately
             del period_data
 
-            # Identify files that are completely covered by this period
+            # Delete only sources fully covered by successful reads and writes.
+            # A later query must never bridge a skipped or unprocessed range.
             for file in list(existing_files):
                 interval = file_intervals.get(file)
 
                 if (
                     file not in protected_files
                     and interval
-                    and (
-                        interval[1] <= query_info["query_end"]
-                        and interval[0] >= queries_to_execute[0]["query_start"]
-                    )
+                    and P.closedopen(interval[0], interval[1] + 1) in rewritten_intervals
                 ):
                     existing_files.pop(file)
                     self.fs.rm(file)
@@ -1163,6 +1171,10 @@ class ParquetDataCatalog(BaseDataCatalog):
             List of query dictionaries ready for execution
 
         """
+        period_in_ns = period.value
+        if period_in_ns <= 0:
+            raise ValueError("Consolidation period must be positive")
+
         # Filter intervals by time range if specified
         used_start: pd.Timestamp | None = time_object_to_dt(start)
         used_end: pd.Timestamp | None = time_object_to_dt(end)
@@ -1185,9 +1197,6 @@ class ParquetDataCatalog(BaseDataCatalog):
                 "Intervals are not contiguous. When ensure_contiguous_files=True, "
                 "all files in the consolidation range must have contiguous timestamps."
             )
-
-        # Convert period to nanoseconds for calculations
-        period_in_ns = period.value
 
         # Group intervals by the target period: split only when the gap between files
         # exceeds one period, since sub-period gaps land in the same consolidated file
@@ -1257,19 +1266,7 @@ class ParquetDataCatalog(BaseDataCatalog):
 
             # Calculate period boundaries for this group using modulo arithmetic
             period_start_ns = (group_start_ts // period_in_ns) * period_in_ns
-            current_start_ns = period_start_ns
-
-            # Safety check to prevent infinite loops
-            max_iterations = 10000  # Reasonable upper bound
-            iteration_count = 0
-
-            while current_start_ns <= group_end_ts:
-                iteration_count += 1
-
-                if iteration_count > max_iterations:
-                    # Safety break to prevent infinite loops
-                    break
-
+            for current_start_ns in range(period_start_ns, group_end_ts + 1, period_in_ns):
                 current_end_ns = current_start_ns + period_in_ns - 1
 
                 # Adjust end to not exceed the group end timestamp
@@ -1284,12 +1281,6 @@ class ParquetDataCatalog(BaseDataCatalog):
                         "use_period_boundaries": ensure_contiguous_files,
                     },
                 )
-
-                # Move to next period
-                current_start_ns += period_in_ns
-
-                if current_start_ns > group_end_ts:
-                    break
 
         # Sort queries by start date to enable efficient file removal
         # Files can be removed when interval[1] <= query_info["query_end"]

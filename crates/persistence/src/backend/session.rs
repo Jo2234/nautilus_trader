@@ -39,7 +39,7 @@ pub struct TsInitComparator;
 
 impl<I> Compare<ElementBatchIter<I, Data>> for TsInitComparator
 where
-    I: Iterator<Item = IntoIter<Data>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<Data>>>,
 {
     fn compare(
         &self,
@@ -265,9 +265,11 @@ impl DataBackendSession {
                 if let Some(ref tn) = custom_type_name {
                     metadata.insert("type_name".to_string(), tn.clone());
                 }
-                T::decode_data_batch(&metadata, batch).unwrap().into_iter()
+                T::decode_data_batch(&metadata, batch)
+                    .map(Vec::into_iter)
+                    .map_err(anyhow::Error::from)
             }
-            Err(e) => panic!("Error getting next batch from RecordBatchStream: {e}"),
+            Err(e) => Err(anyhow::Error::from(e)),
         });
 
         self.batch_streams
@@ -277,18 +279,20 @@ impl DataBackendSession {
             ));
     }
 
-    // Consumes the registered queries and returns a [`QueryResult].
-    // Passes the output of the query though the a KMerge which sorts the
-    // queries in ascending order of `ts_init`.
-    // QueryResult is an iterator that return Vec<Data>.
-    pub fn get_query_result(&mut self) -> QueryResult {
+    /// Consumes the registered queries and merges records in ascending `ts_init` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the first record from any stream fails. Later read
+    /// and decode failures are returned by the result iterator.
+    pub fn get_query_result(&mut self) -> anyhow::Result<QueryResult> {
         let mut kmerge: KMerge<_, _, _> = KMerge::new(TsInitComparator);
 
-        self.batch_streams
-            .drain(..)
-            .for_each(|eager_stream| kmerge.push_iter(eager_stream));
+        for eager_stream in self.batch_streams.drain(..) {
+            kmerge.push_iter(eager_stream)?;
+        }
 
-        kmerge
+        Ok(kmerge)
     }
 
     /// Clears all registered tables and batch streams.
@@ -412,21 +416,26 @@ impl DataQueryResult {
 }
 
 impl Iterator for DataQueryResult {
-    type Item = Vec<Data>;
+    type Item = anyhow::Result<Vec<Data>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         for _ in 0..self.size {
             match self.result.next() {
-                Some(item) => self.acc.push(item),
+                Some(Ok(item)) => self.acc.push(item),
+                Some(Err(error)) => {
+                    self.acc.clear();
+                    self.result.clear();
+                    return Some(Err(error));
+                }
                 None => break,
             }
         }
 
-        // TODO: consider using drain here if perf is unchanged
-        // Some(self.acc.drain(0..).collect())
-        let mut acc: Vec<Data> = Vec::new();
-        std::mem::swap(&mut acc, &mut self.acc);
-        Some(acc)
+        if self.acc.is_empty() {
+            None
+        } else {
+            Some(Ok(std::mem::take(&mut self.acc)))
+        }
     }
 }
 
@@ -434,5 +443,67 @@ impl Drop for DataQueryResult {
     fn drop(&mut self) {
         self.drop_chunk();
         self.result.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
+    use nautilus_model::data::{QuoteTick, stubs::quote_audusd};
+    use rstest::rstest;
+
+    use super::*;
+
+    fn quote_batch() -> RecordBatch {
+        let quote = quote_audusd();
+        QuoteTick::encode_batch(&quote.metadata(), &[quote, quote]).unwrap()
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn query_propagates_late_read_and_decode_errors(#[case] decoding_error: bool) {
+        let mut session = DataBackendSession::new(10);
+        let batch = quote_batch();
+        let bad_batch = if decoding_error {
+            let schema = batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(std::collections::HashMap::new());
+            Ok(RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap())
+        } else {
+            Err(DataFusionError::Execution(
+                "injected batch read failure".into(),
+            ))
+        };
+        let stream = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok(batch), bad_batch]),
+        );
+        session.add_batch_stream::<QuoteTick>(Box::pin(stream), None);
+        let result = session.get_query_result().unwrap();
+        let mut chunks = DataQueryResult::new(result, 10);
+        // Even though the first record decoded, a failed chunk must not look successful.
+        let error = chunks.next().unwrap().unwrap_err();
+        if decoding_error {
+            assert!(error.to_string().contains("instrument_id"));
+        } else {
+            assert!(error.to_string().contains("injected batch read failure"));
+        }
+        assert!(chunks.acc.is_empty());
+        assert!(chunks.next().is_none());
+    }
+
+    #[rstest]
+    fn completed_query_iterator_ends_after_final_chunk() {
+        let mut session = DataBackendSession::new(10);
+        let batch = quote_batch();
+        let stream =
+            RecordBatchStreamAdapter::new(batch.schema(), futures::stream::iter([Ok(batch)]));
+        session.add_batch_stream::<QuoteTick>(Box::pin(stream), None);
+        let mut chunks = DataQueryResult::new(session.get_query_result().unwrap(), 10);
+        assert_eq!(chunks.next().unwrap().unwrap().len(), 2);
+        assert!(chunks.next().is_none());
     }
 }

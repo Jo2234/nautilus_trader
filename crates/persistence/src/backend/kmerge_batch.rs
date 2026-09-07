@@ -28,15 +28,15 @@ use super::{
 };
 
 pub struct EagerStream<T> {
-    rx: Receiver<T>,
-    task: JoinHandle<()>,
+    rx: Receiver<anyhow::Result<T>>,
+    task: Option<JoinHandle<()>>,
     runtime: Arc<Runtime>,
 }
 
 impl<T> EagerStream<T> {
     pub fn from_stream_with_runtime<S>(stream: S, runtime: Arc<Runtime>) -> Self
     where
-        S: Stream<Item = T> + Send + 'static,
+        S: Stream<Item = anyhow::Result<T>> + Send + 'static,
         T: Send + 'static,
     {
         let (tx, rx) = mpsc::channel(1);
@@ -44,69 +44,82 @@ impl<T> EagerStream<T> {
         let task = runtime.spawn(async move {
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
-                if tx.send(item).await.is_err() {
+                let failed = item.is_err();
+                if tx.send(item).await.is_err() || failed {
                     break;
                 }
             }
         });
 
-        Self { rx, task, runtime }
+        Self {
+            rx,
+            task: Some(task),
+            runtime,
+        }
     }
 }
 
 impl<T> Iterator for EagerStream<T> {
-    type Item = T;
+    type Item = anyhow::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.runtime.block_on(self.rx.recv())
+        if let Some(item) = self.runtime.block_on(self.rx.recv()) {
+            return Some(item);
+        }
+
+        // A disconnected channel is EOF only if the producer completed successfully.
+        let task = self.task.take()?;
+        match self.runtime.block_on(task) {
+            Ok(()) => None,
+            Err(error) => Some(Err(anyhow::anyhow!("Data stream producer failed: {error}"))),
+        }
     }
 }
 
 impl<T> Drop for EagerStream<T> {
     fn drop(&mut self) {
         self.rx.close();
-        self.task.abort();
+
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
-// TODO: Investigate implementing Iterator for ElementBatchIter
-// to reduce next element duplication. May be difficult to make it peekable.
 pub struct ElementBatchIter<I, T>
 where
-    I: Iterator<Item = IntoIter<T>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<T>>>,
 {
     pub item: T,
-    batch: I::Item,
+    batch: IntoIter<T>,
     iter: I,
 }
 
 impl<I, T> ElementBatchIter<I, T>
 where
-    I: Iterator<Item = IntoIter<T>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<T>>>,
 {
-    fn new_from_iter(mut iter: I) -> Option<Self> {
-        loop {
-            let Some(mut batch) = iter.next() else {
-                break None;
-            };
-
+    fn new_from_iter(mut iter: I) -> anyhow::Result<Option<Self>> {
+        for batch in iter.by_ref() {
+            let mut batch = batch?;
             if let Some(item) = batch.next() {
-                break Some(Self { item, batch, iter });
+                return Ok(Some(Self { item, batch, iter }));
             }
         }
+        Ok(None)
     }
 }
 
 pub struct KMerge<I, T, C>
 where
-    I: Iterator<Item = IntoIter<T>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<T>>>,
 {
     heap: BinaryHeap<ElementBatchIter<I, T>, C>,
 }
 
 impl<I, T, C> KMerge<I, T, C>
 where
-    I: Iterator<Item = IntoIter<T>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<T>>>,
     C: Compare<ElementBatchIter<I, T>>,
 {
     /// Creates a new [`KMerge`] instance.
@@ -116,10 +129,16 @@ where
         }
     }
 
-    pub fn push_iter(&mut self, s: I) {
-        if let Some(heap_elem) = ElementBatchIter::new_from_iter(s) {
+    /// Adds a sorted batch iterator, propagating errors while reading its first element.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying stream error if initialization fails.
+    pub fn push_iter(&mut self, s: I) -> anyhow::Result<()> {
+        if let Some(heap_elem) = ElementBatchIter::new_from_iter(s)? {
             self.heap.push(heap_elem);
         }
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -129,43 +148,29 @@ where
 
 impl<I, T, C> Iterator for KMerge<I, T, C>
 where
-    I: Iterator<Item = IntoIter<T>>,
+    I: Iterator<Item = anyhow::Result<IntoIter<T>>>,
     C: Compare<ElementBatchIter<I, T>>,
 {
-    type Item = T;
+    type Item = anyhow::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.heap.peek_mut() {
-            Some(mut heap_elem) => {
-                // Get next element from batch
-                match heap_elem.batch.next() {
-                    // Swap current heap element with new element
-                    // return the old element
-                    Some(mut item) => {
-                        std::mem::swap(&mut item, &mut heap_elem.item);
-                        Some(item)
-                    }
-                    // Otherwise get the next batch and the element from it
-                    // Unless the underlying iterator is exhausted
-                    None => loop {
-                        let Some(mut batch) = heap_elem.iter.next() else {
-                            let ElementBatchIter {
-                                item,
-                                batch: _,
-                                iter: _,
-                            } = PeekMut::pop(heap_elem);
-                            break Some(item);
-                        };
-
-                        if let Some(mut item) = batch.next() {
-                            heap_elem.batch = batch;
-                            std::mem::swap(&mut item, &mut heap_elem.item);
-                            break Some(item);
-                        }
-                    },
-                }
+        let mut heap_elem = self.heap.peek_mut()?;
+        loop {
+            if let Some(mut item) = heap_elem.batch.next() {
+                std::mem::swap(&mut item, &mut heap_elem.item);
+                return Some(Ok(item));
             }
-            None => None,
+
+            match heap_elem.iter.next() {
+                Some(Ok(batch)) => heap_elem.batch = batch,
+                Some(Err(error)) => {
+                    // No records from other streams may escape after a failed merge.
+                    drop(heap_elem);
+                    self.heap.clear();
+                    return Some(Err(error));
+                }
+                None => return Some(Ok(PeekMut::pop(heap_elem).item)),
+            }
         }
     }
 }
@@ -180,7 +185,7 @@ mod tests {
     struct OrdComparator;
     impl<S> Compare<ElementBatchIter<S, i32>> for OrdComparator
     where
-        S: Iterator<Item = IntoIter<i32>>,
+        S: Iterator<Item = anyhow::Result<IntoIter<i32>>>,
     {
         fn compare(
             &self,
@@ -194,7 +199,7 @@ mod tests {
 
     impl<S> Compare<ElementBatchIter<S, u64>> for OrdComparator
     where
-        S: Iterator<Item = IntoIter<u64>>,
+        S: Iterator<Item = anyhow::Result<IntoIter<u64>>>,
     {
         fn compare(
             &self,
@@ -211,10 +216,10 @@ mod tests {
         let iter_a = vec![vec![1, 2, 3].into_iter(), vec![7, 8, 9].into_iter()].into_iter();
         let iter_b = vec![vec![4, 5, 6].into_iter()].into_iter();
         let mut kmerge: KMerge<_, i32, _> = KMerge::new(OrdComparator);
-        kmerge.push_iter(iter_a);
-        kmerge.push_iter(iter_b);
+        kmerge.push_iter(iter_a.map(Ok)).unwrap();
+        kmerge.push_iter(iter_b.map(Ok)).unwrap();
 
-        let values: Vec<i32> = kmerge.collect();
+        let values: Vec<i32> = kmerge.collect::<anyhow::Result<_>>().unwrap();
         assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -223,10 +228,10 @@ mod tests {
         let iter_a = vec![vec![1, 2, 6].into_iter(), vec![7, 8, 9].into_iter()].into_iter();
         let iter_b = vec![vec![3, 4, 5, 6].into_iter()].into_iter();
         let mut kmerge: KMerge<_, i32, _> = KMerge::new(OrdComparator);
-        kmerge.push_iter(iter_a);
-        kmerge.push_iter(iter_b);
+        kmerge.push_iter(iter_a.map(Ok)).unwrap();
+        kmerge.push_iter(iter_b.map(Ok)).unwrap();
 
-        let values: Vec<i32> = kmerge.collect();
+        let values: Vec<i32> = kmerge.collect::<anyhow::Result<_>>().unwrap();
         assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 6, 7, 8, 9]);
     }
 
@@ -236,11 +241,11 @@ mod tests {
         let iter_b = vec![vec![2, 4, 8].into_iter()].into_iter();
         let iter_c = vec![vec![3, 5, 9].into_iter(), vec![12, 12, 90].into_iter()].into_iter();
         let mut kmerge: KMerge<_, i32, _> = KMerge::new(OrdComparator);
-        kmerge.push_iter(iter_a);
-        kmerge.push_iter(iter_b);
-        kmerge.push_iter(iter_c);
+        kmerge.push_iter(iter_a.map(Ok)).unwrap();
+        kmerge.push_iter(iter_b.map(Ok)).unwrap();
+        kmerge.push_iter(iter_c.map(Ok)).unwrap();
 
-        let values: Vec<i32> = kmerge.collect();
+        let values: Vec<i32> = kmerge.collect::<anyhow::Result<_>>().unwrap();
         assert_eq!(
             values,
             vec![1, 2, 3, 4, 4, 5, 7, 8, 9, 12, 12, 24, 35, 56, 90]
@@ -257,11 +262,68 @@ mod tests {
         .into_iter();
         let iter_b = vec![vec![2, 4, 6].into_iter()].into_iter();
         let mut kmerge: KMerge<_, i32, _> = KMerge::new(OrdComparator);
-        kmerge.push_iter(iter_a);
-        kmerge.push_iter(iter_b);
+        kmerge.push_iter(iter_a.map(Ok)).unwrap();
+        kmerge.push_iter(iter_b.map(Ok)).unwrap();
 
-        let values: Vec<i32> = kmerge.collect();
+        let values: Vec<i32> = kmerge.collect::<anyhow::Result<_>>().unwrap();
         assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7, 9, 11]);
+    }
+
+    #[rstest]
+    fn stream_error_after_a_batch_fails_the_merge() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let input = futures::stream::iter(vec![
+            Ok(vec![1, 2].into_iter()),
+            Err(anyhow::anyhow!("injected read failure")),
+            Ok(vec![3].into_iter()),
+        ]);
+        let stream = EagerStream::from_stream_with_runtime(input, runtime.clone());
+        let healthy = EagerStream::from_stream_with_runtime(
+            futures::stream::iter([Ok(vec![10, 20].into_iter())]),
+            runtime,
+        );
+        let mut merge = KMerge::new(OrdComparator);
+        merge.push_iter(stream).unwrap();
+        merge.push_iter(healthy).unwrap();
+        assert_eq!(merge.next().unwrap().unwrap(), 1);
+        let error = merge.next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(merge.next().is_none());
+    }
+
+    #[rstest]
+    fn initial_stream_error_is_returned_from_push() {
+        let mut merge: KMerge<_, i32, _> = KMerge::new(OrdComparator);
+        let input = vec![Err(anyhow::anyhow!("first batch failed"))].into_iter();
+        assert!(
+            merge
+                .push_iter(input)
+                .unwrap_err()
+                .to_string()
+                .contains("first batch failed")
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[rstest]
+    fn producer_panic_is_not_end_of_stream() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let input = futures::stream::iter([1, 2]).map(|value| {
+            assert_ne!(value, 2, "injected producer panic");
+            Ok(value)
+        });
+        let mut stream = EagerStream::from_stream_with_runtime(input, runtime);
+        assert_eq!(stream.next().unwrap().unwrap(), 1);
+        assert!(
+            stream
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("injected producer panic")
+        );
+        assert!(stream.next().is_none());
+        assert!(stream.next().is_none());
     }
 
     #[derive(Debug, Clone)]
@@ -309,9 +371,9 @@ mod tests {
             let copy_data = all_data.clone();
             for stream in copy_data {
                 let input = stream.0.into_iter().map(std::iter::IntoIterator::into_iter);
-                kmerge.push_iter(input);
+                kmerge.push_iter(input.map(Ok)).unwrap();
             }
-            let merged_data: Vec<u64> = kmerge.collect();
+            let merged_data: Vec<u64> = kmerge.collect::<anyhow::Result<_>>().unwrap();
 
             let mut sorted_data: Vec<u64> = all_data
                 .into_iter()
@@ -332,9 +394,9 @@ mod tests {
 
             for stream in all_data {
                 let input = stream.0.into_iter().map(std::iter::IntoIterator::into_iter);
-                kmerge.push_iter(input);
+                kmerge.push_iter(input.map(Ok)).unwrap();
             }
-            let merged_data: Vec<u64> = kmerge.collect();
+            let merged_data: Vec<u64> = kmerge.collect::<anyhow::Result<_>>().unwrap();
 
             // Check that the merged data is sorted
             for [a, b] in merged_data.array_windows() {
@@ -355,18 +417,18 @@ mod tests {
             let input_with_empty = data.0.clone().into_iter().map(std::iter::IntoIterator::into_iter);
             let input_without_empty = data.0.into_iter().map(std::iter::IntoIterator::into_iter);
 
-            kmerge_with_empty.push_iter(input_with_empty);
-            kmerge_without_empty.push_iter(input_without_empty);
+            kmerge_with_empty.push_iter(input_with_empty.map(Ok)).unwrap();
+            kmerge_without_empty.push_iter(input_without_empty.map(Ok)).unwrap();
 
             // Add empty iterators to the first merge
             for _ in 0..empty_count {
                 let empty_vec: Vec<Vec<u64>> = vec![];
                 let empty_input = empty_vec.into_iter().map(std::iter::IntoIterator::into_iter);
-                kmerge_with_empty.push_iter(empty_input);
+                kmerge_with_empty.push_iter(empty_input.map(Ok)).unwrap();
             }
 
-            let result_with_empty: Vec<u64> = kmerge_with_empty.collect();
-            let result_without_empty: Vec<u64> = kmerge_without_empty.collect();
+            let result_with_empty: Vec<u64> = kmerge_with_empty.collect::<anyhow::Result<_>>().unwrap();
+            let result_without_empty: Vec<u64> = kmerge_without_empty.collect::<anyhow::Result<_>>().unwrap();
 
             prop_assert_eq!(result_with_empty, result_without_empty, "Empty iterators should not affect result");
         }

@@ -1236,6 +1236,56 @@ class TestConsolidateDataByPeriod:
         assert consolidation["query_start"] <= request_start.value
         assert consolidation["query_end"] >= request_end.value
 
+    @pytest.mark.parametrize("period", [pd.Timedelta(0), pd.Timedelta(-1, unit="ns")])
+    def test_consolidate_rejects_nonpositive_period_without_mutation(self, period):
+        bars = self._create_test_bars([1000, 2000, 3000])
+        self.catalog.write_data(bars)
+        original_files = self.catalog.fs.glob(f"{self.catalog.path}/data/**/*.parquet")
+
+        with pytest.raises(ValueError, match="period must be positive"):
+            self.catalog.consolidate_data_by_period(
+                data_cls=Bar,
+                identifier=self._get_bar_type_identifier(),
+                period=period,
+            )
+
+        assert self.catalog.fs.glob(f"{self.catalog.path}/data/**/*.parquet") == original_files
+        assert self.catalog.bars() == bars
+
+    def test_consolidate_preserves_rows_after_ten_thousand_periods_and_before_split_tail(self):
+        # A single source spans more than 10,000 periods. The final row must be
+        # preserved by the end-boundary split without deleting the middle row.
+        bars = self._create_test_bars([0, 100005, 100025])
+        self.catalog.write_data(bars, start=0, end=100030)
+
+        self.catalog.consolidate_data_by_period(
+            data_cls=Bar,
+            identifier=self._get_bar_type_identifier(),
+            period=pd.Timedelta(10, unit="ns"),
+            end=100020,
+        )
+
+        assert self.catalog.bars() == bars
+
+    def test_consolidate_keeps_source_when_planned_queries_leave_a_gap(self):
+        bars = self._create_test_bars([0, 15, 25])
+        self.catalog.write_data(bars, start=0, end=30)
+        original_files = self.catalog.fs.glob(f"{self.catalog.path}/data/**/*.parquet")
+        queries = [
+            {"query_start": 0, "query_end": 9, "use_period_boundaries": True},
+            {"query_start": 20, "query_end": 30, "use_period_boundaries": True},
+        ]
+        with patch.object(self.catalog, "_prepare_consolidation_queries", return_value=queries):
+            self.catalog.consolidate_data_by_period(
+                data_cls=Bar,
+                identifier=self._get_bar_type_identifier(),
+                period=pd.Timedelta(10, unit="ns"),
+            )
+
+        # Even an incomplete plan must not authorize deletion of its source.
+        assert all(self.catalog.fs.exists(path) for path in original_files)
+        assert 15 in [bar.ts_init for bar in self.catalog.bars()]
+
     def test_consolidate_multiple_instruments(self):
         """
         Test consolidation with multiple instruments.
@@ -2015,8 +2065,8 @@ class TestConsolidateDataByPeriod:
         The predicate deletes a source file only when its interval is fully consumed
         by the consolidation query:
 
-        interval[0] >= queries_to_execute[0]["query_start"]  (left bound, inclusive)
-        interval[1] <= query_info["query_end"]               (right bound, inclusive)
+        Its entire inclusive timestamp interval must be covered by successful
+        reads and writes (or successful empty reads), without any skipped gaps.
 
         query range: |-------------------|
         case A:           |-|                single bar fully inside         -> DELETE

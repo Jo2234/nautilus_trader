@@ -1595,7 +1595,8 @@ impl ParquetDataCatalog {
     /// # Returns
     ///
     /// Returns a [`QueryResult`] containing the query execution context and data.
-    /// Use [`QueryResult::collect()`] to retrieve the actual data records.
+    /// Collect with `collect::<anyhow::Result<Vec<_>>>()` to propagate any read
+    /// or decode failure encountered during iteration.
     ///
     /// # Errors
     ///
@@ -1625,7 +1626,7 @@ impl ParquetDataCatalog {
     ///
     /// // Query all quote data (uses directory-based registration by default)
     /// let result = catalog.query::<QuoteTick>(None, None, None, None, None, true)?;
-    /// let quotes = result.collect();
+    /// let quotes = result.collect::<anyhow::Result<Vec<_>>>()?;
     ///
     /// // Query specific instruments within a time range
     /// let result = catalog.query::<QuoteTick>(
@@ -1727,7 +1728,7 @@ impl ParquetDataCatalog {
             }
         }
 
-        Ok(self.session.get_query_result())
+        self.session.get_query_result()
     }
 
     /// Queries typed data from the catalog and returns results as a strongly-typed vector.
@@ -1854,7 +1855,7 @@ impl ParquetDataCatalog {
             files,
             optimize_file_loading,
         )?;
-        let all_data = query_result.collect();
+        let all_data = query_result.collect::<anyhow::Result<Vec<_>>>()?;
 
         // Convert Data enum variants to specific type T using to_variant
         Ok(to_variant::<T>(all_data))
@@ -2039,8 +2040,8 @@ impl ParquetDataCatalog {
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
 
-        let query_result = self.session.get_query_result();
-        Ok(query_result.collect())
+        let query_result = self.session.get_query_result()?;
+        query_result.collect()
     }
 
     /// Queries all Parquet files for a specific data type and optional instrument IDs.

@@ -96,8 +96,8 @@ where
 
     // Read data
     session.add_file::<T>("data", file_path, None, None)?;
-    let query_result = session.get_query_result();
-    let data = query_result.collect::<Vec<_>>();
+    let query_result = session.get_query_result()?;
+    let data = query_result.collect::<anyhow::Result<Vec<_>>>()?;
     let data: Vec<T> = to_variant(data);
 
     // Extract metadata and add row group info
